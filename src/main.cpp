@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#include "beewi_protocol.h"
+
 // ESP32-C3 SuperMini. All switch to GND, read with internal pullups.
 #define ENC_A_PIN     20
 #define ENC_B_PIN     3
@@ -10,12 +12,11 @@
 #define LED_PIN       8  // onboard blue LED, active low. On = connected and write characteristic found.
 
 #define DEBOUNCE_MS 20
-#define ENC_STEPS_PER_DETENT 2  // quadrature steps per wheel click; try 2 if one click does nothing
+#define ENC_STEPS_PER_DETENT 2  // quadrature steps per wheel click
 
-// Test UUIDs set up in nRF Connect's GATT server. Real bulb write UUID:
-// a8b3fff1-4834-4051-89d0-3de95cddd318
-#define SERVICE_UUID "19B10000-E8F2-537E-4F3C-D1A1D2E45670"
-#define WRITE_UUID   "19B10001-E8F2-537E-4F3C-D1A1D2E45670"
+// nRF Connect fake bulb. For real bulbs, connect to beewi::WRITE_UUID instead.
+#define TEST_SERVICE_UUID "19B10000-E8F2-537E-4F3C-D1A1D2E45670"
+#define TEST_WRITE_UUID   "19B10001-E8F2-537E-4F3C-D1A1D2E45670"
 
 // ---- BLE central ----
 
@@ -26,7 +27,7 @@ static volatile bool targetFound = false;
 
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *dev) override {
-    if (!dev->isAdvertisingService(NimBLEUUID(SERVICE_UUID))) return;
+    if (!dev->isAdvertisingService(NimBLEUUID(TEST_SERVICE_UUID))) return;
     target = dev->getAddress();
     targetFound = true;
     NimBLEDevice::getScan()->stop();  // connect from loop(), not from a callback
@@ -41,7 +42,7 @@ static void connectToTarget() {
   }
   writeChar = nullptr;
   for (NimBLERemoteService *svc : client->getServices(true)) {
-    writeChar = svc->getCharacteristic(WRITE_UUID);
+    writeChar = svc->getCharacteristic(TEST_WRITE_UUID);
     if (writeChar) break;
   }
   Serial.println(writeChar ? "connected" : "connected, but no write characteristic");
@@ -57,12 +58,13 @@ static void maintainConnection() {
   }
 }
 
-// BeeWi frame: 0x55 <cmd> <arg> 0x0D 0x0A
-static void sendFrame(uint8_t cmd, uint8_t arg) {
-  Serial.printf("send 55 %02X %02X 0D 0A\n", cmd, arg);
+static void sendFrame(const beewi::Frame &frame) {
+  Serial.print("send");
+  for (size_t i = 0; i < frame.len; i++) Serial.printf(" %02X", frame.data[i]);
+  Serial.println();
+
   if (!client->isConnected() || !writeChar) return;
-  uint8_t frame[] = {0x55, cmd, arg, 0x0D, 0x0A};
-  writeChar->writeValue(frame, sizeof(frame), !writeChar->canWriteNoResponse());
+  writeChar->writeValue(frame.data, frame.len, !writeChar->canWriteNoResponse());
 }
 
 // ---- Scroll wheel: changes brightness 0..9 ----
@@ -91,11 +93,11 @@ static void pollEncoder() {
   if (clicks == 0) return;
   pending -= clicks * ENC_STEPS_PER_DETENT;
 
-  int level = constrain(brightness + clicks, 0, 9);
+  int level = constrain(brightness + clicks, beewi::LEVEL_MIN, beewi::LEVEL_MAX);
   if (level == brightness) return;
   brightness = level;
   Serial.printf("brightness %d\n", brightness);
-  sendFrame(0x12, brightness + 2);  // levels 0..9 are raw 2..11
+  sendFrame(beewi::cmdBrightness(brightness));
 }
 
 // ---- Buttons: any press toggles power ----
@@ -122,7 +124,7 @@ static void pollButtons() {
       if (!raw) continue;
       powerOn = !powerOn;
       Serial.printf("GPIO%d pressed, power %s\n", b.pin, powerOn ? "on" : "off");
-      sendFrame(0x10, powerOn);
+      sendFrame(powerOn ? beewi::cmdOn() : beewi::cmdOff());
     }
   }
 }
