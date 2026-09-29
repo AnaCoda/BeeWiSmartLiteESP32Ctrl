@@ -1,76 +1,134 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#include <algorithm>
+
 #include "beewi_protocol.h"
 
-// ESP32-C3 SuperMini. All switch to GND, read with internal pullups.
+// My configs on ESP32-C3 SuperMini. All switch to GND, read with internal pullups.
 #define ENC_A_PIN     20
 #define ENC_B_PIN     3
-#define BTN1_PIN      1
-#define BTN2_PIN      4
+#define BTN_LEFT_PIN  1
+#define BTN_RIGHT_PIN 4
 #define BTN_WHEEL_PIN 0
-#define LED_PIN       8  // onboard blue LED, active low. On = connected and write characteristic found.
+#define LED_PIN       8  // onboard blue LED
 
 #define DEBOUNCE_MS 20
 #define ENC_STEPS_PER_DETENT 2  // quadrature steps per wheel click
 
-// nRF Connect fake bulb. For real bulbs, connect to beewi::WRITE_UUID instead.
-#define TEST_SERVICE_UUID "19B10000-E8F2-537E-4F3C-D1A1D2E45670"
-#define TEST_WRITE_UUID   "19B10001-E8F2-537E-4F3C-D1A1D2E45670"
+// BULB1_ADDR (left click) and BULB2_ADDR (right click)
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "Copy include/secrets.example.h to include/secrets.h and add your bulb addresses"
+#endif
 
-// ---- BLE central ----
+#define CONNECT_TIMEOUT_MS 3000
+#define LINK_TIMEOUT_10MS  600  // drop a link after 6 s of silence (NimBLE default 2.56 s)
+#define RETRY_MIN_MS       5000   // doubles after each failed attempt...
+#define RETRY_MAX_MS       60000  // ...up to this, and resets once connected
 
-static NimBLEClient *client = nullptr;
-static NimBLERemoteCharacteristic *writeChar = nullptr;
-static NimBLEAddress target;
-static volatile bool targetFound = false;
+// ---- Bulbs ----
 
-class ScanCallbacks : public NimBLEScanCallbacks {
-  void onResult(const NimBLEAdvertisedDevice *dev) override {
-    if (!dev->isAdvertisingService(NimBLEUUID(TEST_SERVICE_UUID))) return;
-    target = dev->getAddress();
-    targetFound = true;
-    NimBLEDevice::getScan()->stop();  // connect from loop(), not from a callback
+struct Bulb {
+  const char *addr;
+  NimBLEClient *client = nullptr;
+  NimBLERemoteCharacteristic *writeChar = nullptr;
+  bool on = true;
+  uint32_t lastAttempt = 0;
+  uint32_t retryMs = RETRY_MIN_MS;
+};
+
+static Bulb bulbs[] = {{BULB1_ADDR}, {BULB2_ADDR}};
+
+// Levels the scroll wheel sets. Only levels the wheel has set since boot are
+// re-sent on reconnect, so a reset doesn't override what the bulbs already had.
+static bool wheelWarmth = false;  // wheel click switches between brightness and warmth
+static int brightness = beewi::LEVEL_MAX;
+static int warmth = 5;  // default
+static bool brightnessSet = false;
+static bool warmthSet = false;
+
+// Reason codes: 0x208 = signal lost (supervision timeout), 0x213 = bulb closed the
+// connection, 0x216 = we closed it, 0x23E = connection never established
+// for serial debugging
+class ClientCallbacks : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient *c, int reason) override {
+    Serial.printf("%s: disconnected, reason 0x%X\n", c->getPeerAddress().toString().c_str(), reason);
   }
-} scanCallbacks;
+} clientCallbacks;
 
-static void connectToTarget() {
-  Serial.println("connecting...");
-  if (!client->connect(target)) {
-    Serial.println("connect failed");
-    return;
-  }
-  writeChar = nullptr;
-  for (NimBLERemoteService *svc : client->getServices(true)) {
-    writeChar = svc->getCharacteristic(TEST_WRITE_UUID);
-    if (writeChar) break;
-  }
-  Serial.println(writeChar ? "connected" : "connected, but no write characteristic");
-}
+static bool isReady(const Bulb &b) { return b.client->isConnected() && b.writeChar; }
 
-static void maintainConnection() {
-  if (client->isConnected()) return;
-  if (targetFound) {
-    targetFound = false;
-    connectToTarget();
-  } else if (!NimBLEDevice::getScan()->isScanning()) {
-    NimBLEDevice::getScan()->start(5000);
-  }
-}
-
-static void sendFrame(const beewi::Frame &frame) {
-  Serial.print("send");
+static void send(Bulb &b, const beewi::Frame &frame) {
+  Serial.printf("%s: send", b.addr);
   for (size_t i = 0; i < frame.len; i++) Serial.printf(" %02X", frame.data[i]);
   Serial.println();
-
-  if (!client->isConnected() || !writeChar) return;
-  writeChar->writeValue(frame.data, frame.len, !writeChar->canWriteNoResponse());
+  b.writeChar->writeValue(frame.data, frame.len, !b.writeChar->canWriteNoResponse());
 }
 
-// ---- Scroll wheel: changes brightness 0..9 ----
+// Blocks up to CONNECT_TIMEOUT_MS, so buttons aren't read meanwhile.
+static void connectBulb(Bulb &b) {
+  b.writeChar = nullptr;
+  Serial.printf("%s: connecting...\n", b.addr);
+  if (!b.client->connect(NimBLEAddress(b.addr, BLE_ADDR_PUBLIC))) {
+    Serial.printf("%s: connect failed\n", b.addr);
+    return;
+  }
 
-// Quadrature decoder: index is (previous AB << 2) | current AB.
-// Invalid transitions (bounce) count as 0.
+  NimBLERemoteCharacteristic *readChar = nullptr;
+  for (NimBLERemoteService *svc : b.client->getServices(true)) {
+    if (!b.writeChar) b.writeChar = svc->getCharacteristic(beewi::WRITE_UUID);
+    if (!readChar) readChar = svc->getCharacteristic(beewi::READ_UUID);
+  }
+  if (!b.writeChar) {
+    Serial.printf("%s: no write characteristic, disconnecting\n", b.addr);
+    b.client->disconnect();
+    return;
+  }
+
+  // Start from the bulb's real power state so the first toggle does something.
+  beewi::Status status;
+  if (readChar && readChar->canRead()) {
+    NimBLEAttValue value = readChar->readValue();
+    if (beewi::parseStatus(value.data(), value.size(), status)) b.on = status.on;
+  }
+  b.retryMs = RETRY_MIN_MS;
+  Serial.printf("%s: connected, %s, RSSI %d dBm\n", b.addr, b.on ? "on" : "off", b.client->getRssi());
+
+  // Catch up on wheel changes made while this bulb was disconnected
+  if (warmthSet) send(b, beewi::cmdTemperature(warmth));
+  if (brightnessSet) send(b, beewi::cmdBrightness(brightness));
+}
+
+static void maintainBulbs() {
+  uint32_t now = millis();
+  for (Bulb &b : bulbs) {
+    if (b.client->isConnected()) continue;
+    if (b.lastAttempt != 0 && now - b.lastAttempt < b.retryMs) continue;
+    b.lastAttempt = now;
+    connectBulb(b);
+    if (!isReady(b)) {
+      b.retryMs = std::min<uint32_t>(b.retryMs * 2, RETRY_MAX_MS);
+      Serial.printf("%s: retrying in %lus\n", b.addr, (unsigned long)(b.retryMs / 1000));
+    }
+    return; 
+  }
+}
+
+static void toggle(Bulb &b) {
+  if (!isReady(b)) {
+    Serial.printf("%s: not connected\n", b.addr);
+    return;
+  }
+  b.on = !b.on;
+  send(b, b.on ? beewi::cmdOn() : beewi::cmdOff());
+}
+
+// ---- Scroll wheel: brightness or warmth for both bulbs ----
+
+// Quadrature decoder: index is (previous AB << 2) | current AB
+// Invalid transitions (bounce) count as 0 (ignore)
 static const int8_t ENC_TABLE[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 static volatile uint8_t encState = 0;
 static volatile int32_t encSteps = 0;
@@ -79,8 +137,6 @@ static void IRAM_ATTR onEncoderChange() {
   encState = ((encState << 2) | (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN)) & 0x0F;
   encSteps += ENC_TABLE[encState];
 }
-
-static int brightness = 9;
 
 static void pollEncoder() {
   static int32_t pending = 0;
@@ -93,24 +149,41 @@ static void pollEncoder() {
   if (clicks == 0) return;
   pending -= clicks * ENC_STEPS_PER_DETENT;
 
-  int level = constrain(brightness + clicks, beewi::LEVEL_MIN, beewi::LEVEL_MAX);
-  if (level == brightness) return;
-  brightness = level;
-  Serial.printf("brightness %d\n", brightness);
-  sendFrame(beewi::cmdBrightness(brightness));
+  int &value = wheelWarmth ? warmth : brightness;
+  int level = constrain(value + clicks, beewi::LEVEL_MIN, beewi::LEVEL_MAX);
+  if (level == value) return;
+  value = level;
+  (wheelWarmth ? warmthSet : brightnessSet) = true;
+  Serial.printf("%s %d\n", wheelWarmth ? "warmth" : "brightness", value);
+  for (Bulb &b : bulbs) {
+    if (!isReady(b)) continue;
+    send(b, wheelWarmth ? beewi::cmdTemperature(value) : beewi::cmdBrightness(value));
+  }
 }
 
-// ---- Buttons: any press toggles power ----
+static void onWheelClick() {
+  wheelWarmth = !wheelWarmth;
+  Serial.printf("wheel adjusts %s\n", wheelWarmth ? "warmth" : "brightness");
+}
+
+// ---- Buttons ----
+
+static void onLeft() { toggle(bulbs[0]); }
+static void onRight() { toggle(bulbs[1]); }
 
 struct Button {
   uint8_t pin;
-  bool pressed;
-  bool lastRaw;
-  uint32_t changedAt;
+  void (*onPress)();
+  bool pressed = false;
+  bool lastRaw = false;
+  uint32_t changedAt = 0;
 };
 
-static Button buttons[] = {{BTN1_PIN}, {BTN2_PIN}, {BTN_WHEEL_PIN}};
-static bool powerOn = true;
+static Button buttons[] = {
+    {BTN_LEFT_PIN, onLeft},
+    {BTN_RIGHT_PIN, onRight},
+    {BTN_WHEEL_PIN, onWheelClick},
+};
 
 static void pollButtons() {
   uint32_t now = millis();
@@ -122,9 +195,8 @@ static void pollButtons() {
     } else if (raw != b.pressed && now - b.changedAt >= DEBOUNCE_MS) {
       b.pressed = raw;
       if (!raw) continue;
-      powerOn = !powerOn;
-      Serial.printf("GPIO%d pressed, power %s\n", b.pin, powerOn ? "on" : "off");
-      sendFrame(powerOn ? beewi::cmdOn() : beewi::cmdOff());
+      Serial.printf("GPIO%d pressed\n", b.pin);
+      if (b.onPress) b.onPress();
     }
   }
 }
@@ -146,15 +218,22 @@ void setup() {
   attachInterrupt(ENC_B_PIN, onEncoderChange, CHANGE);
 
   NimBLEDevice::init("BeeWi Remote");
-  NimBLEDevice::getScan()->setScanCallbacks(&scanCallbacks);
-  NimBLEDevice::getScan()->setActiveScan(true);
-  client = NimBLEDevice::createClient();
-  client->setConnectTimeout(5000);
+  for (Bulb &b : bulbs) {
+    b.client = NimBLEDevice::createClient();
+    b.client->setClientCallbacks(&clientCallbacks, false);
+    b.client->setConnectTimeout(CONNECT_TIMEOUT_MS);
+    // Interval 30-50 ms (1.25 ms units), no latency, longer link timeout to try and ride out weak signal (more or less arbitrarily picked)
+    b.client->setConnectionParams(24, 40, 0, LINK_TIMEOUT_10MS);
+  }
 }
 
 void loop() {
-  maintainConnection();
-  digitalWrite(LED_PIN, client->isConnected() && writeChar ? LOW : HIGH);
+  maintainBulbs();
+
+  bool allReady = true;
+  for (Bulb &b : bulbs) allReady &= isReady(b);
+  digitalWrite(LED_PIN, allReady ? LOW : HIGH);
+
   pollEncoder();
   pollButtons();
   delay(1);
